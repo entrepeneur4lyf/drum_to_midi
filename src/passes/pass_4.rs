@@ -380,10 +380,8 @@ fn classify_drum_event(
         // High-mid centroid - hi-hats or cymbals (but not splash extreme)
         *scores.entry(DrumClass::HiHat).or_insert(0.0) += 0.4;
         *scores.entry(DrumClass::Cymbal).or_insert(0.0) += 0.3;
-    } else {
-        // Very high centroid - splash cymbal (extreme high frequency)
-        *scores.entry(DrumClass::Splash).or_insert(0.0) += 0.8;
     }
+    // Removed: Very high centroid splash rule - now only strict conjunction can classify splash
 
     // Rule 3: Energy distribution with refined thresholds
     let low_ratio = features.low_energy_ratio;
@@ -399,9 +397,6 @@ fn classify_drum_event(
         *scores.entry(DrumClass::Snare).or_insert(0.0) += 0.3;
         *scores.entry(DrumClass::Rimshot).or_insert(0.0) += 0.2;
         *scores.entry(DrumClass::Cowbell).or_insert(0.0) += 0.3;
-    } else if high_ratio > 0.7 {
-        // Very high frequencies - splash
-        *scores.entry(DrumClass::Splash).or_insert(0.0) += 0.6;
     } else if high_ratio > 0.4 {
         // Dominant high frequencies - hi-hat or cymbal
         *scores.entry(DrumClass::HiHat).or_insert(0.0) += 0.3;
@@ -411,8 +406,7 @@ fn classify_drum_event(
     // Rule 4: Attack time with new thresholds
     let attack_ms = features.attack_time_ms;
     if attack_ms < 3.0 {
-        // Very fast attack - splash or hi-hat
-        *scores.entry(DrumClass::Splash).or_insert(0.0) += 0.3;
+        // Very fast attack - hi-hat (removed splash scoring)
         *scores.entry(DrumClass::HiHat).or_insert(0.0) += 0.2;
     } else if attack_ms < 5.0 {
         // Fast attack - hi-hat or rimshot
@@ -432,8 +426,7 @@ fn classify_drum_event(
     // Rule 5: Zero crossing rate (noisiness)
     let zcr = features.zero_crossing_rate;
     if zcr > 0.4 {
-        // Very high ZCR - splash or hi-hat
-        *scores.entry(DrumClass::Splash).or_insert(0.0) += 0.3;
+        // Very high ZCR - hi-hat (removed splash scoring)
         *scores.entry(DrumClass::HiHat).or_insert(0.0) += 0.2;
     } else if zcr > 0.3 {
         // High ZCR - noisy sound (hi-hat, snare wires, rimshot)
@@ -459,15 +452,35 @@ fn classify_drum_event(
         }
     }
     
-    // Check for splash (extreme high frequency with transient characteristics)
-    if centroid > config.classification.splash_centroid_min && 
-       high_ratio > config.classification.splash_hf_ratio_min &&
-       decay_ms < 80.0 &&
-       attack_ms < 2.0 &&
-       centroid > 8000.0 &&
-       features.attack_hf_ratio > config.classification.splash_transient_hf_min &&
-       features.transient_energy_ratio > config.classification.transient_energy_threshold {
-        // Very high frequency, short decay, very fast attack, extreme frequency, strong transient HF - splash cymbal
+    // Check for splash (ultra-strict conjunction with vetoes)
+    let is_splash_candidate = features.spectral_centroid_hz > 10000.0
+        && features.attack_hf_ratio > 0.90
+        && features.attack_time_ms < 2.0
+        && features.decay_time_ms < 80.0    // HF short decay
+        && features.decay_time_ms < 200.0   // Mid short decay
+        && features.transient_energy_ratio > 0.5
+        && features.attack_to_sustain_ratio > 4.0;
+
+    // Explicit veto guards (ultra-conservative)
+    let hat_veto = (features.spectral_centroid_hz < 9000.0) || (features.decay_time_ms >= 70.0) || features.zero_crossing_rate > 0.3;
+    let crash_veto = (features.decay_time_ms >= 80.0) || (features.decay_time_ms >= 300.0);
+    let bell_veto = features.fundamental_hz.is_some_and(|f| (500.0..=1000.0).contains(&f));
+
+    // Splash classification: ultra-strict with vetoes
+    if is_splash_candidate && !hat_veto && !crash_veto && !bell_veto {
+        // Debug output for splash classifications
+        static mut SPLASH_COUNT: usize = 0;
+        unsafe {
+            SPLASH_COUNT += 1;
+            if SPLASH_COUNT <= 5 {
+                eprintln!("SPLASH #{}: centroid={:.0}Hz, hf_ratio={:.2}, attack={:.1}ms, decay={:.0}ms, transient_energy={:.2}, attack_sustain={:.1}",
+                    SPLASH_COUNT, features.spectral_centroid_hz, features.attack_hf_ratio,
+                    features.attack_time_ms, features.decay_time_ms,
+                    features.transient_energy_ratio, features.attack_to_sustain_ratio);
+                eprintln!("  Veto status: hat={}, crash={}, bell={}",
+                    hat_veto, crash_veto, bell_veto);
+            }
+        }
         *scores.entry(DrumClass::Splash).or_insert(0.0) += 0.8;
     }
     
@@ -593,7 +606,7 @@ pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
     println!("  Classifying {} onset events...", state.onset_events.len());
     let mut classified_events = Vec::new();
 
-    for event in &state.onset_events {
+    for (i, event) in state.onset_events.iter().enumerate() {
         // Extract classification features
         let features = extract_classification_features(
             event,
@@ -608,6 +621,15 @@ pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
         // Perform hierarchical classification
         let (drum_class, acoustic_score, alternatives) =
             classify_drum_event(&features, tuning_info, config);
+
+        // Debug: Log features for first 6 events
+        if i < 6 {
+            eprintln!("Event {}: centroid={:.0}Hz, hf_ratio={:.2}, attack={:.1}ms, decay={:.0}ms, fund={:.0}Hz, zcr={:.2}, label={}",
+                i, features.spectral_centroid_hz, features.attack_hf_ratio,
+                features.attack_time_ms, features.decay_time_ms,
+                features.fundamental_hz.unwrap_or(0.0), features.zero_crossing_rate,
+                drum_class.name());
+        }
 
         // Compute confidence scores
         let (confidence, acoustic_confidence, prior_confidence) =

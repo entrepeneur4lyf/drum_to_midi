@@ -383,6 +383,14 @@ pub struct ClassificationConfig {
     pub splash_transient_hf_min: f32,
     pub cowbell_transient_mid_min: f32,
     pub rimshot_transient_sharpness_min: f32,
+    // Enhanced splash detection parameters
+    pub splash_centroid_min_strict: f32,
+    pub splash_hf_ratio_min_strict: f32,
+    pub splash_attack_max_ms: f32,
+    pub splash_decay_max_ms: f32,
+    pub splash_mid_decay_max_ms: f32,
+    pub splash_transient_energy_min: f32,
+    pub splash_attack_sustain_min: f32,
 }
 
 impl Default for ClassificationConfig {
@@ -405,6 +413,14 @@ impl Default for ClassificationConfig {
             splash_transient_hf_min: 0.8,
             cowbell_transient_mid_min: 0.5,
             rimshot_transient_sharpness_min: 0.3,
+            // Enhanced splash detection defaults
+            splash_centroid_min_strict: 10000.0,
+            splash_hf_ratio_min_strict: 0.90,
+            splash_attack_max_ms: 2.0,
+            splash_decay_max_ms: 80.0,
+            splash_mid_decay_max_ms: 200.0,
+            splash_transient_energy_min: 0.5,
+            splash_attack_sustain_min: 4.0,
         }
     }
 }

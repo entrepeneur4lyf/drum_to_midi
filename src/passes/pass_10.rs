@@ -180,12 +180,16 @@ fn deduplicate_events(events: &[MidiEvent]) -> DeduplicationResult {
     let mut i = 0;
     while i < sorted_events.len() {
         let (current_idx, current_event) = sorted_events[i];
+        let mut group_events = vec![(current_idx, current_event)];
         let mut best_event_idx = current_idx;
         let mut max_confidence = current_event.confidence;
 
-        // Look ahead for overlapping events
+        // Look ahead for overlapping events within a reasonable time window
         let mut j = i + 1;
-        while j < sorted_events.len() {
+        let max_lookahead = 50; // Prevent excessive lookahead
+        let mut lookahead_count = 0;
+
+        while j < sorted_events.len() && lookahead_count < max_lookahead {
             let (_, next_event) = sorted_events[j];
             let time_diff = next_event.time_sec - current_event.time_sec;
 
@@ -200,18 +204,24 @@ fn deduplicate_events(events: &[MidiEvent]) -> DeduplicationResult {
                 break; // No more overlapping events
             }
 
+            group_events.push((sorted_events[j].0, next_event));
+
             // Keep the event with higher confidence
             if next_event.confidence > max_confidence {
                 max_confidence = next_event.confidence;
                 best_event_idx = sorted_events[j].0;
             }
 
-            removed_count += 1;
             j += 1;
+            lookahead_count += 1;
         }
 
         // Add the best event from this group
         kept_events.push(events[best_event_idx].clone());
+
+        // Count removed events (all except the kept one)
+        removed_count += group_events.len() - 1;
+
         i = j; // Skip the processed group
     }
 
@@ -221,37 +231,54 @@ fn deduplicate_events(events: &[MidiEvent]) -> DeduplicationResult {
     }
 }
 
-/// Apply masking based on acoustic properties using k-d tree for spatial queries
+/// Apply masking based on acoustic properties using simple linear search
 fn apply_acoustic_masking(events: &mut Vec<MidiEvent>, config: &Config) {
     if events.is_empty() {
         return;
     }
 
-    // Build k-d tree for efficient spatial queries
-    let kd_tree = KdTree::new(events);
-
     let mut to_remove = Vec::new();
 
-    // Process each event and find potential conflicts using spatial queries
-    for (i, event) in events.iter().enumerate() {
+    // Sort events by time for efficient processing
+    let mut sorted_indices: Vec<usize> = (0..events.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        events[a].time_sec.partial_cmp(&events[b].time_sec).unwrap()
+    });
+
+    // Process each event and find potential conflicts using bounded linear search
+    for &i in &sorted_indices {
         if to_remove.contains(&i) {
             continue; // Already marked for removal
         }
 
-        // Query for events within a small time window and confidence range
-        let time_radius = 0.008; // 8ms time window
-        let conf_radius = 0.3; // Confidence range
+        let event = &events[i];
+        let mut found_conflict = false;
 
-        let nearby_indices =
-            kd_tree.range_query(event.time_sec, event.confidence, time_radius, conf_radius);
+        // Look for conflicts within a small time window (bounded search)
+        let time_window = 0.008; // 8ms time window
+        let start_time = event.time_sec - time_window;
+        let end_time = event.time_sec + time_window;
 
-        // Check for snare/hat conflicts among nearby events
-        for &nearby_idx in &nearby_indices {
+        // Find nearby events using binary search bounds, then linear scan
+        let start_idx = sorted_indices.partition_point(|&idx| events[idx].time_sec < start_time);
+        let end_idx = sorted_indices.partition_point(|&idx| events[idx].time_sec <= end_time);
+
+        // Limit the number of events we check to prevent excessive computation
+        let max_checks = 20;
+        let check_range = start_idx..end_idx.min(start_idx + max_checks);
+
+        for &nearby_idx in sorted_indices[check_range].iter() {
             if nearby_idx == i || to_remove.contains(&nearby_idx) {
                 continue;
             }
 
             let nearby_event = &events[nearby_idx];
+
+            // Additional confidence proximity check
+            let conf_diff = (event.confidence - nearby_event.confidence).abs();
+            if conf_diff > 0.3 {
+                continue; // Too far in confidence space
+            }
 
             // Check for snare/hat conflicts
             let is_snare_hat_conflict = (event.drum_class == DrumClass::Snare
@@ -275,11 +302,17 @@ fn apply_acoustic_masking(events: &mut Vec<MidiEvent>, config: &Config) {
 
                 if should_remove_current && event.confidence < acoustic_escape {
                     to_remove.push(i);
+                    found_conflict = true;
                     break; // Current event is being removed, no need to check more conflicts
                 } else if !should_remove_current && nearby_event.confidence < acoustic_escape {
                     to_remove.push(nearby_idx);
                 }
             }
+        }
+
+        // Prevent checking too many events per iteration
+        if found_conflict {
+            break; // Move to next event quickly
         }
     }
 
@@ -292,7 +325,7 @@ fn apply_acoustic_masking(events: &mut Vec<MidiEvent>, config: &Config) {
     }
 
     println!(
-        "Acoustic masking removed {} conflicting events using k-d tree",
+        "Acoustic masking removed {} conflicting events using bounded search",
         to_remove.len()
     );
 }
@@ -478,6 +511,8 @@ fn generate_qa_statistics(state: &AudioState, output_dir: &std::path::Path) -> D
 }
 
 pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
+    println!("Pass 10: Post-Processing & Export");
+
     // Note: MIDI export and QA artifacts are handled by the main pipeline
     // This pass focuses on final cleanup and preparation
 

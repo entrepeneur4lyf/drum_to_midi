@@ -291,6 +291,8 @@ fn estimate_cymbal_decay(event: &MidiEvent, audio: &[f32], sr: u32) -> f32 {
 }
 
 pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
+    println!("Pass 9: Velocity Estimation");
+
     let midi_events = &mut state.midi_events;
 
     if midi_events.is_empty() {

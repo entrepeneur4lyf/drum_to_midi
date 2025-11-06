@@ -224,8 +224,21 @@ impl GaussianMixtureModel {
     }
 }
 
-/// Compute silhouette score for clustering quality
+/// Safe ratio computation with EPS protection
+fn safe_ratio(num: f32, den: f32, eps: f32) -> f32 {
+    let d = if den.abs() < eps { eps } else { den };
+    (num / d).clamp(-1e6, 1e6)
+}
+
+/// Sanitize NaN/Inf values
+fn sanitize(x: f32, fallback: f32) -> f32 {
+    if x.is_finite() { x } else { fallback }
+}
+
+/// Compute silhouette score for clustering quality (NaN-proof)
 fn silhouette_score(data: &[f32], labels: &[usize], n_clusters: usize) -> f32 {
+    const EPS: f32 = 1e-12;
+
     if n_clusters <= 1 || data.len() < 2 {
         return 0.0;
     }
@@ -248,7 +261,7 @@ fn silhouette_score(data: &[f32], labels: &[usize], n_clusters: usize) -> f32 {
         }
 
         if count_same_cluster > 0 {
-            a_i /= count_same_cluster as f32;
+            a_i = safe_ratio(a_i, count_same_cluster as f32, EPS);
         }
 
         // Compute b(i): minimum average distance to points in other clusters
@@ -270,16 +283,20 @@ fn silhouette_score(data: &[f32], labels: &[usize], n_clusters: usize) -> f32 {
             }
 
             if count_other_cluster > 0 {
-                let avg_dist = dist_sum / count_other_cluster as f32;
+                let avg_dist = safe_ratio(dist_sum, count_other_cluster as f32, EPS);
                 b_i = b_i.min(avg_dist);
             }
         }
 
         // Compute silhouette score for this point
-        if a_i < b_i {
-            scores.push((b_i - a_i) / b_i);
-        } else if a_i == 0.0 && b_i == 0.0 {
-            scores.push(0.0);
+        if b_i > EPS {
+            if a_i < b_i {
+                scores.push(safe_ratio(b_i - a_i, b_i, EPS));
+            } else {
+                scores.push(0.0); // Point is closer to its own cluster than others
+            }
+        } else if a_i < EPS {
+            scores.push(1.0); // Perfect clustering (no distance to own cluster)
         } else {
             scores.push(0.0); // Degenerate case
         }
@@ -288,7 +305,8 @@ fn silhouette_score(data: &[f32], labels: &[usize], n_clusters: usize) -> f32 {
     if scores.is_empty() {
         0.0
     } else {
-        scores.iter().sum::<f32>() / scores.len() as f32
+        let sum: f32 = scores.iter().sum();
+        safe_ratio(sum, scores.len() as f32, EPS)
     }
 }
 
@@ -364,7 +382,12 @@ fn cluster_spectral_peaks(peaks: &[f32], min_samples: usize) -> Option<(Vec<f32>
 
     // Compute silhouette score for quality assessment
     let labels = gmm.predict(peaks);
-    let coherence = silhouette_score(peaks, &labels, n_components);
+    let mut coherence = silhouette_score(peaks, &labels, n_components);
+
+    // Ensure coherence is never NaN (can happen with degenerate clusters)
+    if coherence.is_nan() {
+        coherence = 0.0; // Default to poor clustering quality
+    }
 
     Some((centers, coherence))
 }
@@ -485,41 +508,58 @@ pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
     );
 
     // Perform GMM clustering
-    let tuning_info = if let Some((centers, coherence)) =
+    let (tuning_info, _fallback_mode) = if let Some((centers, coherence)) =
         cluster_spectral_peaks(&spectral_peaks, config.clustering.min_samples)
     {
         println!("  Clustering coherence: {:.3}", coherence);
 
-        // Interpret clusters as drum fundamentals
-        let mut kick_hz = None;
-        let mut toms_hz = Vec::new();
+        // Check if clustering is reliable
+        let reliable_clustering = coherence.is_finite() && coherence >= 0.0 && coherence <= 1.0;
 
-        for &center in &centers {
-            if center >= config.clustering.priors.kick_hz_min
-                && center <= config.clustering.priors.kick_hz_max
-            {
-                kick_hz = Some(center);
-            } else if center > config.clustering.priors.kick_hz_max {
-                // Assume toms are higher frequency than kick
-                toms_hz.push(center);
+        if reliable_clustering {
+            // Interpret clusters as drum fundamentals
+            let mut kick_hz = None;
+            let mut toms_hz = Vec::new();
+
+            for &center in &centers {
+                if center >= config.clustering.priors.kick_hz_min
+                    && center <= config.clustering.priors.kick_hz_max
+                {
+                    kick_hz = Some(center);
+                } else if center > config.clustering.priors.kick_hz_max {
+                    // Assume toms are higher frequency than kick
+                    toms_hz.push(center);
+                }
             }
-        }
 
-        let toms_count = toms_hz.len();
+            let toms_count = toms_hz.len();
 
-        TuningInfo {
-            kick_hz,
-            kick_confidence: coherence,
-            kick_coherence: coherence,
-            toms_hz,
-            toms_confidence: vec![coherence; toms_count],
-            toms_coherence: vec![coherence; toms_count],
-            snare_body_hz: 200.0, // Default estimate
-            snare_body_range_hz: [150.0, 250.0],
+            (TuningInfo {
+                kick_hz,
+                kick_confidence: coherence,
+                kick_coherence: coherence,
+                toms_hz,
+                toms_confidence: vec![coherence; toms_count],
+                toms_coherence: vec![coherence; toms_count],
+                snare_body_hz: 200.0, // Default estimate
+                snare_body_range_hz: [150.0, 250.0],
+            }, false)
+        } else {
+            println!("  Warning: Clustering coherence unreliable ({:.3}), entering dry conservative fallback", coherence);
+            (TuningInfo {
+                kick_hz: None,
+                kick_confidence: 0.0,
+                kick_coherence: 0.0,
+                toms_hz: Vec::new(),
+                toms_confidence: Vec::new(),
+                toms_coherence: Vec::new(),
+                snare_body_hz: 200.0,
+                snare_body_range_hz: [150.0, 250.0],
+            }, true)
         }
     } else {
         println!("  Insufficient data for clustering, using defaults");
-        TuningInfo {
+        (TuningInfo {
             kick_hz: None,
             kick_confidence: 0.0,
             kick_coherence: 0.0,
@@ -528,7 +568,7 @@ pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
             toms_coherence: Vec::new(),
             snare_body_hz: 200.0,
             snare_body_range_hz: [150.0, 250.0],
-        }
+        }, true)
     };
 
     // Estimate reverb characteristics
