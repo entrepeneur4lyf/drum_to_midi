@@ -43,15 +43,15 @@ impl Default for GridInferenceConfig {
         Self {
             acoustic_decay_alpha: 0.05,
             acoustic_tolerance_ms: 15.0,
-            acoustic_weight: 0.7,
-            prior_weight: 0.3,
+            acoustic_weight: 0.8, // Increase acoustic weight
+            prior_weight: 0.2, // Decrease prior weight to rely less on priors
             fill_percentile: 95.0,
             silence_percentile: 5.0,
             min_ghost_velocity: 25, // Increased from 20 to reduce over-flagging
             max_velocity: 127,
             ghost_threshold: 0.3, // Tune based on tests
             velocity_boost_on_beat: 1.2,
-            min_confidence: 0.4, // Hardcoded
+            min_confidence: 0.2, // Lowered to retain more events
             velocity_gamma: 127.0, // Hardcoded gamma for velocity scaling
         }
     }
@@ -404,7 +404,7 @@ pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
         let velocity = compute_velocity(best_acoustic_score, best_prior_score, density_score, is_beat, &grid_config);
 
         // Only create MIDI event if score is high enough and velocity meets min
-        if best_score > 0.1 && velocity >= grid_config.min_ghost_velocity {
+        if best_score > 0.05 && velocity >= grid_config.min_ghost_velocity { // Lowered threshold
             // Use refined time_sec (not snapped, to preserve precision)
             let midi_event = MidiEvent {
                 time_sec: event.refined_time_sec, // Preserve original timing

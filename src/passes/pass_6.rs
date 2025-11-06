@@ -90,8 +90,52 @@ pub fn estimate_tempo_class_weighted(
         }
     }
 
+    // New: Check for tempo halving error by evaluating double tempo
+    let double_tempo = best_tempo * 2.0;
+    let mut double_score = 0.0;
+
+    if double_tempo <= tempo_range_bpm[1] && !events.is_empty() {
+        let beat_interval_sec = 60.0 / double_tempo;
+        let tolerance = beat_interval_sec * 0.05; // 5% tolerance for alignment
+
+        // Generate hypothetical beat positions at double tempo starting from first event
+        let mut current_time = events[0].time_sec;
+        let max_time = events.last().unwrap().time_sec;
+        let mut beat_positions = Vec::new();
+        while current_time <= max_time {
+            beat_positions.push(current_time);
+            current_time += beat_interval_sec;
+        }
+
+        // Score how many events align to these beats
+        for beat in &beat_positions {
+            for event in events {
+                let time_diff = (event.time_sec - *beat).abs();
+                if time_diff < tolerance {
+                    let weight = config
+                        .tempo_weights
+                        .get(&event.drum_class.name().to_string())
+                        .copied()
+                        .unwrap_or(0.3);
+                    double_score += weight * (1.0 - time_diff / tolerance);
+                }
+            }
+        }
+
+        // Normalize double_score relative to number of beats
+        if !beat_positions.is_empty() {
+            double_score /= beat_positions.len() as f32;
+        }
+    }
+
+    // If double tempo has significantly better alignment, prefer it
+    if double_score > best_score * 1.2 {
+        best_tempo = double_tempo;
+        best_score = double_score;
+    }
+
     // Calculate confidence based on score relative to total
-    let total_score: f32 = tempo_histogram.iter().map(|(_, w)| w).sum();
+    let total_score: f32 = tempo_histogram.iter().map(|(_, w)| w).sum::<f32>() + double_score;
     let confidence = if total_score > 0.0 {
         best_score / total_score
     } else {
