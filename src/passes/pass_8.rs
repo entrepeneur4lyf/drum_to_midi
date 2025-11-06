@@ -1,0 +1,357 @@
+//! Pass 8: Grid Inference + Fill/Silence Protection
+
+use crate::analysis::{
+    DrumClass, GridPosition, MidiEvent, RefinedEvent, SelfPriorMatrices, TempoMeterAnalysis,
+};
+use crate::audio::AudioState;
+use crate::config::Config;
+use crate::DrumError;
+use crate::DrumErrorResult;
+
+/// Grid inference configuration parameters
+#[derive(Debug, Clone)]
+struct GridInferenceConfig {
+    /// Acoustic score decay alpha (α=0.05)
+    acoustic_decay_alpha: f32,
+    /// Acoustic score tolerance in ms (tol=15ms)
+    acoustic_tolerance_ms: f32,
+    /// Acoustic weight in combined score (λ_acoustic=0.7)
+    acoustic_weight: f32,
+    /// Prior weight in combined score (λ_prior=0.3)
+    prior_weight: f32,
+    /// Fill protection percentile (95th percentile)
+    fill_percentile: f32,
+    /// Silence protection percentile (5th percentile)
+    silence_percentile: f32,
+    /// Minimum velocity for ghost notes
+    min_ghost_velocity: u8,
+    /// Maximum velocity for MIDI events
+    max_velocity: u8,
+}
+
+impl Default for GridInferenceConfig {
+    fn default() -> Self {
+        Self {
+            acoustic_decay_alpha: 0.05,
+            acoustic_tolerance_ms: 15.0,
+            acoustic_weight: 0.7,
+            prior_weight: 0.3,
+            fill_percentile: 95.0,
+            silence_percentile: 5.0,
+            min_ghost_velocity: 20,
+            max_velocity: 127,
+        }
+    }
+}
+
+/// Compute acoustic score for an event at a grid position
+fn compute_acoustic_score(
+    event: &RefinedEvent,
+    grid_time_sec: f32,
+    config: &GridInferenceConfig,
+) -> f32 {
+    let time_diff_ms = (event.refined_time_sec - grid_time_sec).abs() * 1000.0;
+
+    if time_diff_ms > config.acoustic_tolerance_ms {
+        return 0.0;
+    }
+
+    // Exponential decay from time difference
+    let decay_factor = (-config.acoustic_decay_alpha * time_diff_ms).exp();
+
+    // Weight by event confidence
+    decay_factor * event.confidence
+}
+
+/// Compute prior probability for a drum class at a grid position
+fn compute_prior_probability(
+    drum_class: DrumClass,
+    grid_position: &GridPosition,
+    priors: &SelfPriorMatrices,
+) -> f32 {
+    if let Some(class_priors) = priors.class_priors.get(&drum_class) {
+        if let Some(class_confidences) = priors.class_confidences.get(&drum_class) {
+            // Use sub-beat position within the beat
+            let slot_idx = grid_position.sub_beat % priors.grid_slots_per_beat;
+
+            if slot_idx < class_priors.len() {
+                // Weight by confidence
+                class_priors[slot_idx] * class_confidences[slot_idx]
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    }
+}
+
+/// Compute rhythmic density curve for fill/silence protection
+fn compute_density_curve(
+    events: &[RefinedEvent],
+    tempo_analysis: &TempoMeterAnalysis,
+    _config: &Config,
+) -> Vec<f32> {
+    let duration_sec = events
+        .iter()
+        .map(|e| e.refined_time_sec)
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(10.0);
+
+    let n_beats = ((duration_sec * tempo_analysis.bpm) / 60.0).ceil() as usize;
+    let mut density_curve = vec![0.0; n_beats];
+
+    // Count events per beat
+    for event in events {
+        let beat_idx = ((event.refined_time_sec * tempo_analysis.bpm) / 60.0) as usize;
+        if beat_idx < density_curve.len() {
+            density_curve[beat_idx] += 1.0;
+        }
+    }
+
+    density_curve
+}
+
+/// Compute percentile-based density thresholds
+fn compute_density_thresholds(density_curve: &[f32], config: &GridInferenceConfig) -> (f32, f32) {
+    if density_curve.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut sorted_density = density_curve.to_vec();
+    sorted_density.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let fill_idx = ((config.fill_percentile / 100.0) * (sorted_density.len() - 1) as f32) as usize;
+    let silence_idx =
+        ((config.silence_percentile / 100.0) * (sorted_density.len() - 1) as f32) as usize;
+
+    (sorted_density[fill_idx], sorted_density[silence_idx])
+}
+
+/// Convert time to grid position
+fn time_to_grid_position(
+    time_sec: f32,
+    tempo_analysis: &TempoMeterAnalysis,
+    grid_slots_per_beat: usize,
+) -> GridPosition {
+    let beats_per_minute = tempo_analysis.bpm;
+    let total_beats = time_sec * beats_per_minute / 60.0;
+
+    let bar = (total_beats / 4.0) as usize; // Assuming 4/4 time
+    let beat_in_bar = (total_beats % 4.0) as usize;
+    let sub_beat_position = total_beats % 1.0;
+    let sub_beat = (sub_beat_position * grid_slots_per_beat as f32) as usize;
+    let ticks = ((sub_beat_position * grid_slots_per_beat as f32 % 1.0) * 96.0) as usize; // MIDI ticks
+
+    GridPosition {
+        bar,
+        beat: beat_in_bar,
+        sub_beat,
+        ticks,
+    }
+}
+
+/// Convert grid position to time
+fn grid_position_to_time(grid_pos: &GridPosition, tempo_analysis: &TempoMeterAnalysis) -> f32 {
+    let beats_per_minute = tempo_analysis.bpm;
+    let total_beats =
+        grid_pos.bar as f32 * 4.0 + grid_pos.beat as f32 + grid_pos.sub_beat as f32 / 4.0; // Assuming 16th notes (4 slots per beat)
+
+    total_beats * 60.0 / beats_per_minute
+}
+
+/// Perform gap filling with neighbor velocity interpolation
+fn fill_gaps_with_neighbors(
+    midi_events: &mut Vec<MidiEvent>,
+    _refined_events: &[RefinedEvent],
+    tempo_analysis: &TempoMeterAnalysis,
+    config: &GridInferenceConfig,
+) {
+    if midi_events.is_empty() {
+        return;
+    }
+
+    // Sort events by time
+    midi_events.sort_by(|a, b| a.time_sec.partial_cmp(&b.time_sec).unwrap());
+
+    // Find gaps and insert ghost notes
+    let mut filled_events = Vec::new();
+
+    for i in 0..midi_events.len() - 1 {
+        filled_events.push(midi_events[i].clone());
+
+        let current_time = midi_events[i].time_sec;
+        let next_time = midi_events[i + 1].time_sec;
+        let time_gap = next_time - current_time;
+
+        // If gap is more than one beat, consider filling
+        let beat_duration = 60.0 / tempo_analysis.bpm;
+        if time_gap > beat_duration * 1.5 {
+            // Insert ghost note at midpoint
+            let ghost_time = current_time + time_gap / 2.0;
+            let ghost_velocity =
+                ((midi_events[i].velocity as f32 + midi_events[i + 1].velocity as f32) / 2.0) as u8;
+            let ghost_velocity = ghost_velocity.max(config.min_ghost_velocity);
+
+            // Use the same class as the previous event for simplicity
+            let ghost_event = MidiEvent {
+                time_sec: ghost_time,
+                grid_position: time_to_grid_position(ghost_time, tempo_analysis, 4),
+                drum_class: midi_events[i].drum_class,
+                velocity: ghost_velocity,
+                confidence: 0.5, // Lower confidence for ghost notes
+                is_ghost_note: true,
+                acoustic_score: 0.0,
+                prior_score: 0.3,
+                density_score: 0.0,
+            };
+
+            filled_events.push(ghost_event);
+        }
+    }
+
+    // Add the last event
+    if !midi_events.is_empty() {
+        filled_events.push(midi_events.last().unwrap().clone());
+    }
+
+    *midi_events = filled_events;
+}
+
+pub fn run(state: &mut AudioState, config: &Config) -> DrumErrorResult<()> {
+    // Validate inputs
+    let refined_events = &state.refined_events;
+    let priors = match state.self_priors.as_ref() {
+        Some(p) => p,
+        None => {
+            return Err(DrumError::ProcessingPipelineError(
+                "Self-prior matrices not available".to_string(),
+            ))
+        }
+    };
+    let tempo_analysis = match state.tempo_meter_analysis.as_ref() {
+        Some(t) => t,
+        None => {
+            return Err(DrumError::ProcessingPipelineError(
+                "Tempo/meter analysis not available".to_string(),
+            ))
+        }
+    };
+
+    if refined_events.is_empty() {
+        // No events to process, return empty MIDI events
+        state.midi_events = Vec::new();
+        return Ok(());
+    }
+
+    let grid_config = GridInferenceConfig::default();
+
+    // Compute density curve for fill/silence protection
+    let density_curve = compute_density_curve(refined_events, tempo_analysis, config);
+    let (fill_threshold, silence_threshold) =
+        compute_density_thresholds(&density_curve, &grid_config);
+
+    // Group events by time windows for grid inference
+    let mut midi_events = Vec::new();
+    let grid_slots_per_beat = priors.grid_slots_per_beat;
+
+    // Process each refined event
+    for event in refined_events {
+        // Find the best grid position for this event
+        let mut best_score = 0.0;
+        let mut best_grid_pos =
+            time_to_grid_position(event.refined_time_sec, tempo_analysis, grid_slots_per_beat);
+        let mut best_acoustic_score = 0.0;
+        let mut best_prior_score = 0.0;
+
+        // Try nearby grid positions
+        for beat_offset in -1..=1 {
+            for sub_beat_offset in -1..=1 {
+                let test_beat = ((best_grid_pos.beat as i32 + beat_offset).max(0) as usize).min(3); // Assuming 4/4 time
+                let test_sub_beat = ((best_grid_pos.sub_beat as i32 + sub_beat_offset).max(0)
+                    as usize)
+                    .min(grid_slots_per_beat - 1);
+
+                let test_grid_pos = GridPosition {
+                    bar: best_grid_pos.bar,
+                    beat: test_beat,
+                    sub_beat: test_sub_beat,
+                    ticks: best_grid_pos.ticks,
+                };
+
+                let test_time = grid_position_to_time(&test_grid_pos, tempo_analysis);
+
+                // Compute scores
+                let acoustic_score = compute_acoustic_score(event, test_time, &grid_config);
+                let prior_score =
+                    compute_prior_probability(event.drum_class, &test_grid_pos, priors);
+                let combined_score = grid_config.acoustic_weight * acoustic_score
+                    + grid_config.prior_weight * prior_score;
+
+                if combined_score > best_score {
+                    best_score = combined_score;
+                    best_grid_pos = test_grid_pos;
+                    best_acoustic_score = acoustic_score;
+                    best_prior_score = prior_score;
+                }
+            }
+        }
+
+        // Apply fill/silence protection
+        let beat_idx = ((event.refined_time_sec * tempo_analysis.bpm) / 60.0) as usize;
+        let local_density = if beat_idx < density_curve.len() {
+            density_curve[beat_idx]
+        } else {
+            0.0
+        };
+
+        let density_score = if local_density > fill_threshold {
+            // High density - reduce fill probability
+            0.2
+        } else if local_density < silence_threshold {
+            // Low density - allow ghost notes
+            0.8
+        } else {
+            0.5
+        };
+
+        // Only create MIDI event if combined score is high enough
+        if best_score > 0.1 {
+            // Convert confidence to velocity
+            let velocity = ((best_score * config.velocity.gamma) as u8)
+                .min(grid_config.max_velocity)
+                .max(1);
+
+            let midi_event = MidiEvent {
+                time_sec: grid_position_to_time(&best_grid_pos, tempo_analysis),
+                grid_position: best_grid_pos,
+                drum_class: event.drum_class,
+                velocity,
+                confidence: best_score,
+                is_ghost_note: false,
+                acoustic_score: best_acoustic_score,
+                prior_score: best_prior_score,
+                density_score,
+            };
+
+            midi_events.push(midi_event);
+        }
+    }
+
+    // Apply gap filling
+    fill_gaps_with_neighbors(
+        &mut midi_events,
+        refined_events,
+        tempo_analysis,
+        &grid_config,
+    );
+
+    // Sort final events by time
+    midi_events.sort_by(|a, b| a.time_sec.partial_cmp(&b.time_sec).unwrap());
+
+    state.midi_events = midi_events;
+
+    Ok(())
+}
